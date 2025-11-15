@@ -15,8 +15,10 @@ import com.lowagie.text.pdf.BaseFont;
 
 import java.io.*;
 import java.math.BigInteger;
+import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -44,64 +46,88 @@ public class PdfGenerationService {
     private String fontPath;
 
     private static final double DEFAULT_LINE_SPACING = 1.5d;
+    
+    // Font cache để tránh reload font mỗi request
+    private static final Map<String, BaseFont> fontCache = new ConcurrentHashMap<>();
+    private static final Object fontCacheLock = new Object();
+    
+    // Template byte cache - cache template file bytes
+    private static final Map<String, byte[]> templateBytesCache = new ConcurrentHashMap<>();
+    private static final Map<String, Long> templateFileModifiedCache = new ConcurrentHashMap<>();
 
     /**
      * Generate PDF from DOCX template
      * Điền thông tin từ request vào DOCX, sau đó convert sang PDF
+     * Tối ưu: Cache template bytes để tránh đọc từ disk mỗi request
      */
     public byte[] generatePdfFromDocxTemplate(PdfGenerationRequest request) throws IOException, XWPFConverterException {
         String templatePath = Paths.get(templateDir, request.getTemplateName() + ".docx").toString();
+        File templateFile = new File(templatePath);
 
-        log.info("Đang xử lý DOCX template: {}", templatePath);
+        log.debug("Đang xử lý DOCX template: {}", templatePath);
 
-        // 1. Đọc DOCX template
-        XWPFDocument docxDocument;
-        try (FileInputStream fis = new FileInputStream(templatePath)) {
-            docxDocument = new XWPFDocument(fis);
-        }
+        // 1. Đọc DOCX template với caching
+        XWPFDocument docxDocument = loadTemplateWithCache(templateFile, request.getTemplateName());
 
         try {
             // 2. Điền thông tin từ request body vào DOCX
             if (request.getVariables() != null && !request.getVariables().isEmpty()) {
-                log.info("Đang điền {} biến vào DOCX", request.getVariables().size());
+                log.debug("Đang điền {} biến vào DOCX", request.getVariables().size());
                 fillVariablesIntoDocx(docxDocument, request.getVariables());
             }
 
             normalizeLineSpacing(docxDocument);
 
-            log.info("Đã điền xong thông tin, đang convert sang PDF bằng PdfConverter");
+            log.debug("Đã điền xong thông tin, đang convert sang PDF bằng PdfConverter");
 
             // 3. Convert DOCX sang PDF bằng PdfConverter
-            ByteArrayOutputStream pdfOutputStream = new ByteArrayOutputStream();
+            // Tối ưu: Dùng initial size ước lượng để giảm memory reallocation
+            int estimatedSize = (int) (templateFile.length() * 1.2); // Estimate PDF ~20% larger than DOCX
+            ByteArrayOutputStream pdfOutputStream = new ByteArrayOutputStream(Math.max(estimatedSize, 8192));
 
-            PdfOptions options = PdfOptions.create();
+            try {
+                PdfOptions options = PdfOptions.create();
+                options.fontEncoding("UTF-8");
 
-            options.fontEncoding("UTF-8");
+                // Cấu hình font với caching để tránh reload font mỗi request
+                if (fontPath != null && !fontPath.trim().isEmpty()) {
+                    options.fontProvider((familyName, encoding, size, style, color) -> {
+                        try {
+                            BaseFont baseFont = getCachedFont(fontPath);
+                            return new Font(baseFont, size, style, color);
+                        } catch (Exception e) {
+                            log.warn("Lỗi khi load font, sử dụng font mặc định: {}", e.getMessage());
+                            return new Font(Font.HELVETICA, size, style, color);
+                        }
+                    });
+                }
 
-            // Cấu hình font nếu có
-            if (fontPath != null && !fontPath.trim().isEmpty()) {
-                options.fontProvider((familyName, encoding, size, style, color) -> {
-                    try {
-                        BaseFont baseFont = BaseFont.createFont(fontPath, BaseFont.IDENTITY_H, BaseFont.EMBEDDED);
-                        return new Font(baseFont, size, style, color);
-                    } catch (Exception e) {
-                        log.warn("Lỗi khi load font, sử dụng font mặc định: {}", e.getMessage());
-                        return new Font(Font.HELVETICA, size, style, color);
-                    }
-                });
+                // Convert DOCX to PDF
+                PdfConverter.getInstance().convert(docxDocument, pdfOutputStream, options);
+
+                byte[] pdfBytes = pdfOutputStream.toByteArray();
+                log.debug("Đã tạo PDF thành công: {} bytes", pdfBytes.length);
+                
+                // Tối ưu: Trả về array trước khi close streams
+                return pdfBytes;
+                
+            } finally {
+                // Cleanup output stream
+                try {
+                    pdfOutputStream.close();
+                } catch (IOException e) {
+                    log.debug("Error closing output stream: {}", e.getMessage());
+                }
             }
 
-            // Convert DOCX to PDF
-            PdfConverter.getInstance().convert(docxDocument, pdfOutputStream, options);
-
-            byte[] pdfBytes = pdfOutputStream.toByteArray();
-            log.info("Đã tạo PDF thành công: {} bytes", pdfBytes.length);
-            return pdfBytes;
-
         } finally {
-            // Đóng document
+            // Đóng document - QUAN TRỌNG: giải phóng memory
             if (docxDocument != null) {
-                docxDocument.close();
+                try {
+                    docxDocument.close();
+                } catch (IOException e) {
+                    log.debug("Error closing document: {}", e.getMessage());
+                }
             }
         }
     }
@@ -903,6 +929,93 @@ public class PdfGenerationService {
         }
         
         applyLineSpacingToParagraph(paragraph, lineSpacing, inTable);
+    }
+
+    /**
+     * Load template với caching để tối ưu hiệu năng
+     * Cache template bytes và kiểm tra file modification time để invalidate cache khi file thay đổi
+     * 
+     * @param templateFile File template
+     * @param templateName Tên template (để làm cache key)
+     * @return XWPFDocument từ template
+     * @throws IOException Nếu không đọc được file
+     */
+    private XWPFDocument loadTemplateWithCache(File templateFile, String templateName) throws IOException {
+        if (!templateFile.exists()) {
+            throw new FileNotFoundException("Template not found: " + templateFile.getAbsolutePath());
+        }
+
+        String cacheKey = templateName;
+        long currentModifiedTime = templateFile.lastModified();
+        
+        // Kiểm tra cache và file modification time
+        byte[] templateBytes = templateBytesCache.get(cacheKey);
+        Long cachedModifiedTime = templateFileModifiedCache.get(cacheKey);
+        
+        // Invalidate cache nếu file đã thay đổi hoặc chưa có trong cache
+        if (templateBytes == null || cachedModifiedTime == null || cachedModifiedTime < currentModifiedTime) {
+            log.debug("Loading template from disk: {} (cache miss or file changed)", templateName);
+            
+            // Đọc template từ disk
+            templateBytes = Files.readAllBytes(templateFile.toPath());
+            
+            // Update cache
+            templateBytesCache.put(cacheKey, templateBytes);
+            templateFileModifiedCache.put(cacheKey, currentModifiedTime);
+            
+            // Cleanup cache nếu quá lớn (giữ tối đa 100 templates)
+            if (templateBytesCache.size() > 100) {
+                // Remove oldest entry (simple strategy - remove first entry)
+                String oldestKey = templateBytesCache.keySet().iterator().next();
+                templateBytesCache.remove(oldestKey);
+                templateFileModifiedCache.remove(oldestKey);
+                log.debug("Cache cleanup: removed template {}", oldestKey);
+            }
+        } else {
+            log.debug("Loading template from cache: {}", templateName);
+        }
+        
+        // Tạo XWPFDocument từ cached bytes
+        return new XWPFDocument(new ByteArrayInputStream(templateBytes));
+    }
+
+    /**
+     * Get font với caching để tránh reload font mỗi request
+     * Font được cache trong memory để tối ưu hiệu năng
+     * 
+     * @param fontPath Đường dẫn đến font file
+     * @return BaseFont từ cache hoặc load mới
+     * @throws Exception Nếu không load được font
+     */
+    private BaseFont getCachedFont(String fontPath) throws Exception {
+        BaseFont cachedFont = fontCache.get(fontPath);
+        
+        if (cachedFont != null) {
+            return cachedFont;
+        }
+        
+        // Synchronized để tránh load font nhiều lần cùng lúc
+        synchronized (fontCacheLock) {
+            // Double-check sau khi acquire lock
+            cachedFont = fontCache.get(fontPath);
+            if (cachedFont != null) {
+                return cachedFont;
+            }
+            
+            // Load font mới
+            log.debug("Loading font from disk: {}", fontPath);
+            BaseFont newFont = BaseFont.createFont(fontPath, BaseFont.IDENTITY_H, BaseFont.EMBEDDED);
+            fontCache.put(fontPath, newFont);
+            
+            // Cleanup font cache nếu quá lớn (giữ tối đa 10 fonts)
+            if (fontCache.size() > 10) {
+                String oldestKey = fontCache.keySet().iterator().next();
+                fontCache.remove(oldestKey);
+                log.debug("Font cache cleanup: removed font {}", oldestKey);
+            }
+            
+            return newFont;
+        }
     }
 
     /**

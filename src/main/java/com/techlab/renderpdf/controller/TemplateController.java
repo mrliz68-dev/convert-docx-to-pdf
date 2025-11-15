@@ -1,5 +1,7 @@
 package com.techlab.renderpdf.controller;
 
+import com.techlab.renderpdf.model.PdfGenerationRequest;
+import com.techlab.renderpdf.service.PdfGenerationService;
 import com.techlab.renderpdf.service.TemplateService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -24,6 +26,8 @@ import java.util.Map;
 public class TemplateController {
 
     private final TemplateService templateService;
+
+    private final PdfGenerationService pdfGenerationService;
 
     /**
      * Upload a DOCX template file
@@ -82,6 +86,39 @@ public class TemplateController {
             log.info("Previewing template: {}", templateName);
             
             byte[] pdfBytes = templateService.previewTemplate(templateName);
+            
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_PDF);
+            headers.setContentDispositionFormData("inline", templateName + "_preview.pdf");
+            headers.setContentLength(pdfBytes.length);
+            
+            return new ResponseEntity<>(pdfBytes, headers, HttpStatus.OK);
+            
+        } catch (java.io.FileNotFoundException e) {
+            log.error("Template not found: {}", templateName);
+            return ResponseEntity.notFound().build();
+            
+        } catch (Exception e) {
+            log.error("Error previewing template: {}", templateName, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(("Error: " + e.getMessage()).getBytes());
+        }
+    }
+
+    /**
+     * Preview a template by converting it to PDF
+     * 
+     * GET /api/templates/{templateName}/preview
+     * 
+     * @param templateName Template name (without .docx extension)
+     * @return PDF file for preview
+     */
+    @GetMapping("/{templateName}/preview-v2")
+    public ResponseEntity<byte[]> previewTemplateV2(@PathVariable String templateName) {
+        try {
+            log.info("Previewing template: {}", templateName);
+            
+            byte[] pdfBytes = pdfGenerationService.generatePdfFromDocxTemplate(new PdfGenerationRequest(templateName, null, null, null));
             
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_PDF);

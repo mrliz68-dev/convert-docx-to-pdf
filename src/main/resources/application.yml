@@ -8,9 +8,30 @@ spring:
     multipart:
       max-file-size: 50MB
       max-request-size: 50MB
+  cache:
+    type: caffeine
+    caffeine:
+      spec: maximumSize=100,expireAfterWrite=1h
 
 server:
   port: 8080
+  threads:
+    virtual:
+      enabled: true
+  # Tối ưu cho concurrent requests
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 10
+    max-connections: 10000
+    accept-count: 1000
+    connection-timeout: 20000
+    max-http-post-size: 50MB
+  # Compression để giảm bandwidth
+  compression:
+    enabled: true
+    mime-types: application/json,application/xml,text/html,text/xml,text/plain,application/pdf
+    min-response-size: 1024
 
 # PDF generation settings
 pdf:
@@ -19,6 +40,12 @@ pdf:
     max-concurrent: 1000
     template-dir: ./templates
     output-dir: ./output
+    cache:
+      template:
+        max-size: 100
+        expire-hours: 1
+      font:
+        max-size: 10
 
 # LibreOffice settings
 libreoffice:
