@@ -533,28 +533,225 @@ public class PdfGenerationService {
 
     /**
      * Đảm bảo paragraph có line spacing rõ ràng để PdfConverter hiểu đúng
+     * Sử dụng AUTO spacing rule với giá trị multiplier chính xác
+     * 
+     * @param paragraph Paragraph cần set spacing
+     * @param lineSpacing Line spacing multiplier (1.0 = single, 1.5 = 1.5x, etc.)
+     * @param inTable true nếu paragraph trong table, false nếu paragraph thường
      */
-    private void applyLineSpacingToParagraph(XWPFParagraph paragraph, double lineSpacing) {
+    private void applyLineSpacingToParagraph(XWPFParagraph paragraph, double lineSpacing, boolean inTable) {
         if (paragraph == null) {
             return;
         }
 
+        // Kiểm tra paragraph có text hay không (có runs với text)
+        boolean hasText = false;
+        String paragraphText = paragraph.getText();
+        if (paragraphText != null && !paragraphText.trim().isEmpty()) {
+            hasText = true;
+        }
+        
+        // Kiểm tra paragraph có runs với text thực sự không (loại trừ runs chỉ có whitespace)
+        if (!hasText && paragraph.getRuns() != null) {
+            for (XWPFRun run : paragraph.getRuns()) {
+                String runText = run.getText(0); // getText(index) - 0 là index đầu tiên
+                if (runText != null && !runText.trim().isEmpty()) {
+                    hasText = true;
+                    break;
+                }
+            }
+        }
+
+        // Nếu chưa có line spacing, dùng default
         double spacingValue = lineSpacing > 0 ? lineSpacing : DEFAULT_LINE_SPACING;
 
+        // Lấy font size từ run đầu tiên (nếu có) để tính spacing chính xác
+        int fontSize = 12; // default font size
+        if (paragraph.getRuns() != null && !paragraph.getRuns().isEmpty()) {
+            XWPFRun firstRun = paragraph.getRuns().get(0);
+            try {
+                // Thử lấy font size
+                Double fontSizeDouble = firstRun.getFontSizeAsDouble();
+                if (fontSizeDouble != null && fontSizeDouble > 0) {
+                    fontSize = fontSizeDouble.intValue();
+                }
+            } catch (Exception e) {
+                log.debug("Không thể lấy font size, dùng default 12: {}", e.getMessage());
+            }
+        }
+
         try {
+            // Set ở API level với AUTO
             paragraph.setSpacingBetween(spacingValue, LineSpacingRule.AUTO);
         } catch (Exception e) {
             log.debug("Không thể set spacingBetween: {}", e.getMessage());
         }
 
         try {
+            // QUAN TRỌNG: Set ở XML level để PdfConverter nhận diện
             CTPPr pPr = paragraph.getCTP().isSetPPr() ? paragraph.getCTP().getPPr() : paragraph.getCTP().addNewPPr();
             CTSpacing spacing = pPr.isSetSpacing() ? pPr.getSpacing() : pPr.addNewSpacing();
-            spacing.setLine(BigInteger.valueOf(Math.round(spacingValue * 240)));
+            
+            // Sử dụng AUTO rule với multiplier - PdfConverter có thể xử lý tốt hơn
+            // AUTO rule: line spacing = multiplier * font size (tính bằng twips)
+            // Line spacing 1.5 = 1.5 * 240 = 360 twips
+            BigInteger lineSpacingTwips = BigInteger.valueOf(Math.round(spacingValue * 240));
+            spacing.setLine(lineSpacingTwips);
             spacing.setLineRule(STLineSpacingRule.AUTO);
+            
+            log.debug("Set line spacing AUTO: {} twips (multiplier {}, fontSize={}, hasText={}, inTable={})", 
+                    lineSpacingTwips, spacingValue, fontSize, hasText, inTable);
+            
+            // Đảm bảo spacing element được set vào paragraph properties
+            if (!pPr.isSetSpacing()) {
+                pPr.setSpacing(spacing);
+            }
+            
+            // QUAN TRỌNG: Xử lý spacingAfter và spacingBefore
+            // - Paragraphs trống (không có text): KHÔNG set spacingAfter để tránh dãn quá nhiều
+            // - Paragraphs có text: chỉ set spacingAfter nhẹ cho paragraphs ngoài bảng
+            if (!hasText) {
+                // Paragraph trống: không set spacingAfter và spacingBefore
+                // Chỉ unset nếu đã được set trước đó
+                try {
+                    if (spacing.isSetAfter()) {
+                        spacing.unsetAfter();
+                    }
+                } catch (Exception e) {
+                    // Ignore nếu không thể unset
+                }
+                try {
+                    if (spacing.isSetBefore()) {
+                        spacing.unsetBefore();
+                    }
+                } catch (Exception e) {
+                    // Ignore nếu không thể unset
+                }
+                log.debug("Paragraph trống: unset spacingAfter và spacingBefore");
+            } else {
+                // Paragraph có text - thêm spacingAfter để tạo khoảng cách giữa các paragraphs
+                // Cách này tạo khoảng cách giữa các dòng text bằng cách tăng khoảng cách giữa paragraphs
+                if (!inTable) {
+                    // Ngoài bảng: set spacingAfter để tạo khoảng cách giữa các paragraphs
+                    // SpacingAfter tạo khoảng cách sau paragraph, làm các dòng text trông dãn nhau hơn
+                    // Tính dựa trên font size và line spacing: fontSize * (spacingValue - 1) * 20 (points to twips)
+                    double extraSpacingPoints = fontSize * (spacingValue - 0.5);
+                    
+                    // Kiểm tra xem paragraph đã có spacingAfter chưa
+                    int existingSpacingAfter = paragraph.getSpacingAfter();
+                    int spacingAfterTwips;
+                    
+                    if (extraSpacingPoints > 0) {
+                        // Có line spacing > 1.0: tính spacingAfter dựa trên extra spacing
+                        // HỆ SỐ: 1.5 = 150% (giảm từ 1.0 để tránh dãn quá nhiều)
+                        spacingAfterTwips = (int) Math.round(extraSpacingPoints * 20 * 1.5);
+                        // Nếu đã có spacingAfter sẵn, lấy giá trị lớn hơn (nhưng không quá lớn)
+                        if (existingSpacingAfter > 0) {
+                            spacingAfterTwips = Math.max(spacingAfterTwips, (int)(existingSpacingAfter * 1.2));
+                        }
+                    } else {
+                        // SpacingValue = 1.0: set spacingAfter nhẹ
+                        // HỆ SỐ: 0.4 = 40% (giảm từ 0.6 để tránh dãn quá nhiều)
+                        spacingAfterTwips = (int) Math.round(fontSize * 0.4 * 20);
+                        // Nếu đã có spacingAfter sẵn và nhỏ hơn, giữ nguyên
+                        if (existingSpacingAfter > 0 && existingSpacingAfter < spacingAfterTwips) {
+                            spacingAfterTwips = existingSpacingAfter;
+                        }
+                    }
+                    
+                    // Giới hạn spacingAfter tối đa để tránh dãn quá nhiều
+                    int maxSpacingAfter = (int) Math.round(fontSize * 2.0 * 20); // Tối đa 2.0x font size
+                    spacingAfterTwips = Math.min(spacingAfterTwips, maxSpacingAfter);
+                    
+                    if (spacingAfterTwips > 0) {
+                        spacing.setAfter(BigInteger.valueOf(spacingAfterTwips));
+                        paragraph.setSpacingAfter(spacingAfterTwips); // Cũng set ở API level
+                    }
+                } else {
+                    // Trong bảng: set spacingAfter nhẹ hơn để không dãn quá nhiều
+                    double extraSpacingPoints = fontSize * (spacingValue - 1.0);
+                    
+                    // Kiểm tra spacingAfter hiện tại
+                    int existingSpacingAfter = paragraph.getSpacingAfter();
+                    int spacingAfterTwips;
+                    
+                    if (extraSpacingPoints > 0) {
+                        // HỆ SỐ: 0.3 = 30% (giảm từ 0.5 để tránh dãn quá nhiều trong bảng)
+                        spacingAfterTwips = (int) Math.round(extraSpacingPoints * 20 * 0.5);
+                        if (existingSpacingAfter > 0) {
+                            spacingAfterTwips = Math.max(spacingAfterTwips, (int)(existingSpacingAfter * 1.1));
+                        }
+                    } else {
+                        // HỆ SỐ: 0.2 = 20% (giảm từ 0.3 để tránh dãn quá nhiều trong bảng)
+                        spacingAfterTwips = (int) Math.round(fontSize * 0.5 * 20);
+                        // Giữ nguyên nếu đã có spacingAfter nhỏ hơn
+                        if (existingSpacingAfter > 0 && existingSpacingAfter < spacingAfterTwips) {
+                            spacingAfterTwips = existingSpacingAfter;
+                        }
+                    }
+                    
+                    // Giới hạn spacingAfter trong bảng (nhỏ hơn ngoài bảng)
+                    int maxSpacingAfter = (int) Math.round(fontSize * 0.8 * 20); // Tối đa 0.8x font size
+                    spacingAfterTwips = Math.min(spacingAfterTwips, maxSpacingAfter);
+                    
+                    if (spacingAfterTwips > 0) {
+                        spacing.setAfter(BigInteger.valueOf(spacingAfterTwips));
+                        paragraph.setSpacingAfter(spacingAfterTwips);
+                    } else {
+                        // Nếu không set được spacingAfter, đảm bảo không có spacingAfter cũ
+                        try {
+                            if (spacing.isSetAfter()) {
+                                spacing.unsetAfter();
+                            }
+                        } catch (Exception e) {
+                            // Ignore nếu không thể unset
+                        }
+                    }
+                }
+                // Không set spacingBefore cho paragraphs có text
+                try {
+                    if (spacing.isSetBefore()) {
+                        spacing.unsetBefore();
+                    }
+                } catch (Exception e) {
+                    // Ignore nếu không thể unset
+                }
+            }
+            
         } catch (Exception e) {
-            log.debug("Không thể set CTSpacing: {}", e.getMessage());
+            String errorMsg = e.getMessage();
+            if (errorMsg == null || errorMsg.isEmpty()) {
+                errorMsg = e.getClass().getSimpleName();
+            }
+            log.warn("Không thể set CTSpacing: {} - {}", errorMsg, e.getClass().getName());
+            log.debug("Stack trace cho CTSpacing error:", e);
         }
+        
+        // Force verify và set lại nếu cần
+        try {
+            if (paragraph.getSpacingBetween() <= 0) {
+                paragraph.setSpacingBetween(spacingValue, LineSpacingRule.AUTO);
+            }
+        } catch (Exception e) {
+            log.debug("Không thể force set spacingBetween: {}", e.getMessage());
+        }
+        
+        // Force unset spacingAfter ở API level cho paragraphs trống
+        if (!hasText) {
+            try {
+                paragraph.setSpacingAfter(0);
+                paragraph.setSpacingBefore(0);
+            } catch (Exception e) {
+                log.debug("Không thể unset spacingAfter/spacingBefore: {}", e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Overload method - mặc định không trong bảng
+     */
+    private void applyLineSpacingToParagraph(XWPFParagraph paragraph, double lineSpacing) {
+        applyLineSpacingToParagraph(paragraph, lineSpacing, false);
     }
 
     /**
@@ -594,37 +791,48 @@ public class PdfGenerationService {
     /**
      * Chuẩn hóa và preserve line spacing trong document
      * Đảm bảo line spacing được giữ nguyên khi convert sang PDF
+     * Force set line spacing cho TẤT CẢ paragraphs để PdfConverter nhận diện đúng
      */
     private void normalizeLineSpacing(XWPFDocument document) {
-        // Xử lý paragraphs trong body
+        log.debug("Bắt đầu normalize line spacing cho toàn bộ document");
+        
+        int paragraphCount = 0;
+        
+        // Xử lý paragraphs trong body (KHÔNG trong bảng)
         for (XWPFParagraph paragraph : document.getParagraphs()) {
-            preserveParagraphSpacing(paragraph);
+            preserveParagraphSpacing(paragraph, false); // false = không trong bảng
+            paragraphCount++;
         }
 
-        // Xử lý trong tables
+        // Xử lý trong tables (TRONG bảng)
         for (XWPFTable table : document.getTables()) {
             for (XWPFTableRow row : table.getRows()) {
                 for (XWPFTableCell cell : row.getTableCells()) {
                     for (XWPFParagraph paragraph : cell.getParagraphs()) {
-                        preserveParagraphSpacing(paragraph);
+                        preserveParagraphSpacing(paragraph, true); // true = trong bảng
+                        paragraphCount++;
                     }
                 }
             }
         }
 
-        // Xử lý trong headers và footers
+        // Xử lý trong headers và footers (KHÔNG trong bảng)
         if (document.getHeaderFooterPolicy() != null) {
             if (document.getHeaderFooterPolicy().getDefaultHeader() != null) {
                 for (XWPFParagraph paragraph : document.getHeaderFooterPolicy().getDefaultHeader().getParagraphs()) {
-                    preserveParagraphSpacing(paragraph);
+                    preserveParagraphSpacing(paragraph, false); // false = không trong bảng
+                    paragraphCount++;
                 }
             }
             if (document.getHeaderFooterPolicy().getDefaultFooter() != null) {
                 for (XWPFParagraph paragraph : document.getHeaderFooterPolicy().getDefaultFooter().getParagraphs()) {
-                    preserveParagraphSpacing(paragraph);
+                    preserveParagraphSpacing(paragraph, false); // false = không trong bảng
+                    paragraphCount++;
                 }
             }
         }
+        
+        log.debug("Đã normalize line spacing cho {} paragraphs", paragraphCount);
     }
 
     /**
@@ -666,20 +874,35 @@ public class PdfGenerationService {
                 target.setIndentationFirstLine(source.getIndentationFirstLine());
             }
         } catch (Exception e) {
-            log.warn("Không thể copy paragraph formatting: {}", e.getMessage());
+            String errorMsg = e.getMessage();
+            if (errorMsg == null || errorMsg.isEmpty()) {
+                errorMsg = e.getClass().getSimpleName();
+            }
+            log.warn("Không thể copy paragraph formatting: {} - {}", errorMsg, e.getClass().getName());
+            log.debug("Stack trace cho copy paragraph formatting error:", e);
         }
     }
 
     /**
      * Preserve line spacing và các spacing properties của paragraph
+     * Nếu paragraph chưa có line spacing, sẽ set default line spacing
+     * 
+     * @param paragraph Paragraph cần preserve spacing
+     * @param inTable true nếu paragraph trong table, false nếu paragraph thường
      */
-    private void preserveParagraphSpacing(XWPFParagraph paragraph) {
+    private void preserveParagraphSpacing(XWPFParagraph paragraph, boolean inTable) {
         if (paragraph == null) {
             return;
         }
 
         double lineSpacing = resolveParagraphLineSpacing(paragraph);
-        applyLineSpacingToParagraph(paragraph, lineSpacing);
+        
+        // Nếu chưa có line spacing rõ ràng, set default
+        if (lineSpacing <= 0) {
+            lineSpacing = DEFAULT_LINE_SPACING;
+        }
+        
+        applyLineSpacingToParagraph(paragraph, lineSpacing, inTable);
     }
 
     /**
@@ -702,3 +925,4 @@ public class PdfGenerationService {
         }
     }
 }
+
